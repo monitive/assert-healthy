@@ -3,7 +3,7 @@
 A GitHub Action that asserts one or more [uptimemonitoring.com](https://uptimemonitoring.com) monitors are healthy. Drop it into a workflow to gate a deploy, a canary, or any pipeline step on real-world reachability.
 
 ```yaml
-- uses: uptimemonitoring/assert-healthy@v2
+- uses: uptimemonitoring/assert-healthy@v1
   with:
     api-key: ${{ secrets.UPTIMEMONITORING_API_KEY }}
     monitor-ids: ${{ vars.MONITOR_ID }}
@@ -62,7 +62,7 @@ For each monitor ID in the input list the action calls `POST /api/v1/monitors/{i
 ## Multi-monitor
 
 ```yaml
-- uses: uptimemonitoring/assert-healthy@v2
+- uses: uptimemonitoring/assert-healthy@v1
   with:
     api-key: ${{ secrets.UPTIMEMONITORING_API_KEY }}
     monitor-ids: |
@@ -77,18 +77,11 @@ Each monitor is checked independently. The step fails if any is unhealthy and li
 
 | Pattern    | Behavior                                                                  |
 | ---------- | ------------------------------------------------------------------------- |
-| `@v2`      | Auto-picks the latest 2.x.y release. Recommended for most workflows.      |
-| `@v2.0.0`  | Frozen — never auto-upgrades. Use this when you need byte-stable behavior. |
-| `@v1`      | Stays on the v1 cached-state behavior. Use if you are not ready to migrate. |
+| `@v1`      | Auto-picks the latest 1.x.y release. Recommended for most workflows.      |
+| `@v1.0.1`  | Frozen — never auto-upgrades. Use this when you need byte-stable behavior. |
 | `@master`  | Bleeding edge. Not recommended.                                           |
 
-When 2.x.y ships, the moving `v2` ref is force-updated to point at the new tag.
-
-## Migration from `@v1`
-
-The only breaking change is the default probe path: v2 calls `POST /test` first (force-fresh) instead of going straight to `GET /monitors/{id}` (cached state). The action inputs and outputs are identical; no workflow changes are required beyond updating the ref.
-
-If you want to keep v1 cached-only behaviour, pin to `@v1` — that ref is not moved by v2 releases.
+When 1.x.y ships, the moving `v1` ref is force-updated to point at the new tag.
 
 ## Behavior on errors
 

@@ -1,6 +1,6 @@
 {
   "name": "assert-healthy",
-  "version": "2.0.0",
+  "version": "1.0.1",
   "private": true,
   "description": "GitHub Action that asserts uptimemonitoring.com monitors are healthy.",
   "homepage": "https://github.com/uptimemonitoring/assert-healthy",
