@@ -56,7 +56,7 @@ For each monitor ID in the input list the action calls `POST /api/v1/monitors/{i
 | 0    | All monitors healthy.                                                       |
 | 1    | At least one monitor is unhealthy (the normal "deploy is bad" signal).      |
 | 2    | Input error — missing or malformed `api-key` / `monitor-ids` / etc. Also set when every monitor's `/test` call returns 401/403/404 (auth or configuration error). |
-| 3    | Every monitor was unreachable due to transport errors (DNS, TLS, reset). The action could not get a verdict and is intentionally distinguishable from a down monitor. |
+| 3    | Every monitor was unreachable — transport error on both `/test` and the cached-state fallback `GET`. The action could not get a verdict and is intentionally distinguishable from a down monitor. |
 | 4    | Kill switch active upstream (operator-initiated dispatch pause). Retry after the upstream window passes (default 60s). |
 
 ## Multi-monitor
@@ -95,8 +95,8 @@ If you want to keep v1 cached-only behaviour, pin to `@v1` — that ref is not m
 - **HTTP 4xx (auth/permission/not-found) from `/test`** — fails the step immediately with exit 2 (auth/config class). No cached-state fallback is attempted — the error is definitive.
 - **HTTP 5xx from `/test`** — retried once before falling back to the cached `GET` path with a warning.
 - **Non-HTTP monitor** — `/test` is HTTP-only today; the action falls through to the cached state for these monitors with a warning. Verdict comes from the last scheduled probe.
-- **Transport errors (DNS, TLS, reset, timeout)** — fails the step. If every monitor in the run failed this way, the exit code is 3 instead of 1.
-- **Protocol errors (HTTP 200 but invalid JSON, missing fields, or an unknown `state`)** — fails the step with exit 1. The server was reachable, so this is **not** a transport error and does not produce exit 3.
+- **Transport errors (DNS, TLS, reset, timeout) on `/test`** — falls back to cached `GET` with a warning. If a transport error then occurs on the cached `GET` too, the step fails (exit 3 if every monitor failed this way, otherwise exit 1).
+- **Protocol errors (HTTP 200 but invalid JSON, missing fields, or an unknown `state`) on `/test`** — falls back to cached `GET` with a warning. If a protocol error then occurs on the cached `GET`, the step fails with exit 1.
 - **Retry on `unknown` whose retry fetch fails** — keeps the first `unknown` reading and treats the run as `unhealthy` after retry (exit 1).
 
 ## Privacy

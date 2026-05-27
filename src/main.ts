@@ -134,7 +134,7 @@ async function freshProbeWithRetry(
 ): Promise<MonitorOutcome | null> {
   const MAX_429_RETRIES = 3;
   const BACKOFF_429_MS = [1000, 3000, 5000];
-  const MAX_SLEEP_MS = 60_000;
+  const MAX_SLEEP_MS = 300_000;
 
   let attempts429 = 0;
   let attempts5xx = 0;

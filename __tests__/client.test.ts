@@ -542,6 +542,56 @@ describe('createFetcher.testMonitor', () => {
       expect(result.message).toContain('ECONNREFUSED');
     }
   });
+
+  it('429 with HTTP-date Retry-After → retryAfterSec computed from date', async () => {
+    const fixedNow = new Date('2025-01-01T00:00:00.000Z').getTime();
+    const dateSpy = vi.spyOn(Date, 'now').mockReturnValue(fixedNow);
+    try {
+      state.postMock.mockResolvedValue(
+        makeMockResponse('too many tests for this monitor; retry in 120s', 429, {
+          'retry-after': 'Wed, 01 Jan 2025 00:02:00 GMT',
+        }),
+      );
+      const { createFetcher } = await import('../src/client.js');
+      const fetcher = createFetcher({ apiKey: 'umk_live_X' });
+      const result = await fetcher.testMonitor(1);
+      expect(result.kind).toBe('rate_limited');
+      if (result.kind === 'rate_limited') {
+        expect(result.retryAfterSec).toBe(120);
+        expect(result.source).toBe('monitor');
+      }
+    } finally {
+      dateSpy.mockRestore();
+    }
+  });
+
+  it('503 kill_switch with no Retry-After header but retry_after in body → kill_switch with body value', async () => {
+    state.postMock.mockResolvedValue(
+      makeMockResponse('{"error":"kill_switch_active","retry_after":45}', 503),
+    );
+    const { createFetcher } = await import('../src/client.js');
+    const fetcher = createFetcher({ apiKey: 'umk_live_X' });
+    const result = await fetcher.testMonitor(1);
+    expect(result.kind).toBe('kill_switch');
+    if (result.kind === 'kill_switch') {
+      expect(result.retryAfterSec).toBe(45);
+    }
+  });
+
+  it('503 kill_switch with both Retry-After header and retry_after in body → header wins', async () => {
+    state.postMock.mockResolvedValue(
+      makeMockResponse('{"error":"kill_switch_active","retry_after":999}', 503, {
+        'retry-after': '60',
+      }),
+    );
+    const { createFetcher } = await import('../src/client.js');
+    const fetcher = createFetcher({ apiKey: 'umk_live_X' });
+    const result = await fetcher.testMonitor(1);
+    expect(result.kind).toBe('kill_switch');
+    if (result.kind === 'kill_switch') {
+      expect(result.retryAfterSec).toBe(60);
+    }
+  });
 });
 
 describe('USER_AGENT', () => {

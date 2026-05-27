@@ -6,7 +6,7 @@ All notable changes to `assert-healthy` are documented here. The format follows 
 
 ### Changed
 
-- **Default behavior is now `POST /api/v1/monitors/{id}/test` first (force-fresh, single-region)** with automatic fallback to cached `GET /monitors/{id}` on upstream rate-limit, 5xx, or unsupported monitor type. v1 callers who want the old cached-only semantics can stay on `@v1`.
+- **Default behavior is now `POST /api/v1/monitors/{id}/test` first (force-fresh, single-region)** with automatic fallback to cached `GET /monitors/{id}` on upstream rate-limit, 5xx, unsupported monitor type, or transport/protocol error on the `/test` call. Each fallback is logged as a warning. v1 callers who want the old cached-only semantics can stay on `@v1`.
 
 ### Added
 

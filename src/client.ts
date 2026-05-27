@@ -127,11 +127,18 @@ function validateTestProbe(
   };
 }
 
-function parseRetryAfterHeader(value: string | string[] | undefined): number | null {
+function parseRetryAfterHeader(
+  value: string | string[] | undefined,
+  nowMs = Date.now(),
+): number | null {
   const str = typeof value === 'string' ? value : value?.[0];
   if (str === undefined) return null;
   const n = parseInt(str, 10);
-  return isNaN(n) ? null : n;
+  if (!isNaN(n) && n > 0) return n;
+  // RFC 7231: Retry-After may also be an HTTP-date string.
+  const ts = Date.parse(str);
+  if (!isNaN(ts)) return Math.max(0, Math.ceil((ts - nowMs) / 1000));
+  return null;
 }
 
 export function createFetcher(opts: FetcherOptions): Fetcher {
@@ -253,7 +260,16 @@ export function createFetcher(opts: FetcherOptions): Fetcher {
       // kill_switch_active is a deliberate operator pause; a "real" upstream 503
       // with no marker rides the generic http_error path and falls back to cached.
       if (status === 503 && body.includes('kill_switch_active')) {
-        const retryAfterSec = parseRetryAfterHeader(response.message.headers['retry-after']);
+        let retryAfterSec = parseRetryAfterHeader(response.message.headers['retry-after']);
+        if (retryAfterSec === null) {
+          try {
+            const parsed = JSON.parse(body) as Record<string, unknown>;
+            const bodyVal = parsed['retry_after'];
+            if (typeof bodyVal === 'number' && bodyVal > 0) retryAfterSec = bodyVal;
+          } catch {
+            /* body may not be JSON */
+          }
+        }
         return { kind: 'kill_switch', retryAfterSec };
       }
 
