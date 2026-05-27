@@ -21,10 +21,7 @@ module.exports = {
   rules: {
     'prettier/prettier': 'error',
     '@typescript-eslint/no-unused-vars': ['error', { argsIgnorePattern: '^_' }],
-    '@typescript-eslint/explicit-function-return-type': [
-      'error',
-      { allowExpressions: true },
-    ],
+    '@typescript-eslint/explicit-function-return-type': ['error', { allowExpressions: true }],
     '@typescript-eslint/no-explicit-any': 'error',
     '@typescript-eslint/no-floating-promises': 'error',
     'no-console': ['error', { allow: ['warn', 'error'] }],
@@ -44,12 +41,5 @@ module.exports = {
       },
     },
   ],
-  ignorePatterns: [
-    'dist/',
-    'build/',
-    'node_modules/',
-    'coverage/',
-    'vitest.config.ts',
-    '*.cjs',
-  ],
+  ignorePatterns: ['dist/', 'build/', 'node_modules/', 'coverage/', 'vitest.config.ts', '*.cjs'],
 };

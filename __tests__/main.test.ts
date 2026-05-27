@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import * as core from '@actions/core';
-import { evaluateMonitor, run } from '../src/main.js';
-import type { Fetcher, FetchResult, MonitorDetail } from '../src/client.js';
+import { evaluateMonitor, run, EXIT_KILL_SWITCH } from '../src/main.js';
+import type { Fetcher, FetchResult, MonitorDetail, TestResult } from '../src/client.js';
 import type { MonitorStatus } from '../src/policy.js';
 
 function detail(status: MonitorStatus, opts: Partial<MonitorDetail['state']> = {}): MonitorDetail {
@@ -20,6 +20,8 @@ function ok(d: MonitorDetail): FetchResult {
   return { kind: 'ok', detail: d };
 }
 
+// Default fetcher for legacy tests: testMonitor always returns unsupported so
+// the fresh-probe path falls through to the existing cached-GET logic.
 function makeFetcher(responses: Record<number, FetchResult[]>): {
   fetcher: Fetcher;
   calls: number[];
@@ -38,9 +40,53 @@ function makeFetcher(responses: Record<number, FetchResult[]>): {
       cursor[id] = idx + 1;
       return r;
     },
+    async testMonitor(_id: number): Promise<TestResult> {
+      return { kind: 'unsupported', message: '' };
+    },
   };
   return { fetcher, calls };
 }
+
+function makeFetcherWithTest(config: {
+  test: Record<number, TestResult[]>;
+  get: Record<number, FetchResult[]>;
+}): {
+  fetcher: Fetcher;
+  testCalls: number[];
+  getCalls: number[];
+} {
+  const testCursor: Record<number, number> = {};
+  const getCursor: Record<number, number> = {};
+  const testCalls: number[] = [];
+  const getCalls: number[] = [];
+  const fetcher: Fetcher = {
+    async getMonitor(id: number): Promise<FetchResult> {
+      getCalls.push(id);
+      const list = config.get[id];
+      if (!list || list.length === 0) {
+        throw new Error(`no GET mock for monitor ${id}`);
+      }
+      const idx = getCursor[id] ?? 0;
+      const r = list[Math.min(idx, list.length - 1)];
+      getCursor[id] = idx + 1;
+      return r;
+    },
+    async testMonitor(id: number): Promise<TestResult> {
+      testCalls.push(id);
+      const list = config.test[id];
+      if (!list || list.length === 0) {
+        throw new Error(`no POST/test mock for monitor ${id}`);
+      }
+      const idx = testCursor[id] ?? 0;
+      const r = list[Math.min(idx, list.length - 1)];
+      testCursor[id] = idx + 1;
+      return r;
+    },
+  };
+  return { fetcher, testCalls, getCalls };
+}
+
+// ─── Legacy cached-GET path (via unsupported shim) ───────────────────────────
 
 describe('evaluateMonitor', () => {
   it('up → healthy, no retry', async () => {
@@ -155,7 +201,7 @@ describe('evaluateMonitor', () => {
       { strictFlapping: true, unknownRetryDelayMs: 0 },
     );
     expect(out.outcome).toEqual({ kind: 'unhealthy', reason: 'transport_error' });
-    expect(out.detail).toBe('ECONNREFUSED');
+    expect(out.detail).toContain('ECONNREFUSED');
   });
 
   it('protocol_error → unhealthy/protocol_error', async () => {
@@ -187,6 +233,241 @@ describe('evaluateMonitor', () => {
   });
 });
 
+// ─── Force-fresh /test path ───────────────────────────────────────────────────
+
+describe('evaluateMonitor (force-fresh /test)', () => {
+  let warnSpy: ReturnType<typeof vi.spyOn>;
+
+  beforeEach(() => {
+    vi.spyOn(core, 'info').mockImplementation(() => undefined);
+    warnSpy = vi.spyOn(core, 'warning').mockImplementation(() => undefined);
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('state:up → healthy/up, no GET call made', async () => {
+    const { fetcher, testCalls, getCalls } = makeFetcherWithTest({
+      test: {
+        1: [
+          { kind: 'ok', probe: { state: 'up', region: 'EU-W', statusCode: 200, errorText: null } },
+        ],
+      },
+      get: {},
+    });
+    const out = await evaluateMonitor(
+      1,
+      { fetcher, sleep: vi.fn() },
+      { strictFlapping: true, unknownRetryDelayMs: 0 },
+    );
+    expect(out.outcome).toEqual({ kind: 'healthy', reason: 'up' });
+    expect(testCalls).toEqual([1]);
+    expect(getCalls).toEqual([]);
+  });
+
+  it('state:down → unhealthy/down, no GET call, detail has region and HTTP status', async () => {
+    const { fetcher, getCalls } = makeFetcherWithTest({
+      test: {
+        1: [
+          {
+            kind: 'ok',
+            probe: { state: 'down', region: 'EU-W', statusCode: 503, errorText: 'timeout' },
+          },
+        ],
+      },
+      get: {},
+    });
+    const out = await evaluateMonitor(
+      1,
+      { fetcher, sleep: vi.fn() },
+      { strictFlapping: true, unknownRetryDelayMs: 0 },
+    );
+    expect(out.outcome).toEqual({ kind: 'unhealthy', reason: 'down' });
+    expect(getCalls).toEqual([]);
+    expect(out.detail).toContain('EU-W');
+    expect(out.detail).toContain('503');
+  });
+
+  it('fresh state:up populates region from probe response', async () => {
+    const { fetcher } = makeFetcherWithTest({
+      test: {
+        1: [
+          { kind: 'ok', probe: { state: 'up', region: 'US-E', statusCode: null, errorText: null } },
+        ],
+      },
+      get: {},
+    });
+    const out = await evaluateMonitor(
+      1,
+      { fetcher, sleep: vi.fn() },
+      { strictFlapping: true, unknownRetryDelayMs: 0 },
+    );
+    expect(out.region).toBe('US-E');
+    expect(out.lastCheckAt).toBeNull();
+  });
+
+  it('429 × 2 then ok(up) → success after 2 retries, sleep called with max(retryAfter, backoff)', async () => {
+    const sleep = vi.fn().mockResolvedValue(undefined);
+    const { fetcher } = makeFetcherWithTest({
+      test: {
+        1: [
+          { kind: 'rate_limited', retryAfterSec: 7, source: 'monitor' },
+          { kind: 'rate_limited', retryAfterSec: 7, source: 'monitor' },
+          { kind: 'ok', probe: { state: 'up', region: null, statusCode: null, errorText: null } },
+        ],
+      },
+      get: {},
+    });
+    const out = await evaluateMonitor(
+      1,
+      { fetcher, sleep },
+      { strictFlapping: true, unknownRetryDelayMs: 0 },
+    );
+    expect(out.outcome.kind).toBe('healthy');
+    // First retry: max(7000, 1000) = 7000; second retry: max(7000, 3000) = 7000
+    expect(sleep).toHaveBeenNthCalledWith(1, 7000);
+    expect(sleep).toHaveBeenNthCalledWith(2, 7000);
+    expect(sleep).toHaveBeenCalledTimes(2);
+  });
+
+  it('429 × 4 → falls through to cached GET, detail prefixed with (fallback)', async () => {
+    const sleep = vi.fn().mockResolvedValue(undefined);
+    const rl: TestResult = { kind: 'rate_limited', retryAfterSec: 3, source: 'monitor' };
+    const { fetcher } = makeFetcherWithTest({
+      test: { 1: [rl, rl, rl, rl] },
+      get: { 1: [ok(detail('up'))] },
+    });
+    const out = await evaluateMonitor(
+      1,
+      { fetcher, sleep },
+      { strictFlapping: true, unknownRetryDelayMs: 0 },
+    );
+    expect(out.outcome.kind).toBe('healthy');
+    expect(out.detail).toMatch(/^\(fallback\)/);
+    // 3 sleeps for the 3 retries (4th hits the limit and returns null)
+    expect(sleep).toHaveBeenCalledTimes(3);
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('rate-limited after 3 retries'));
+  });
+
+  it('429 × 4 then cached GET returns down → unhealthy/down via fallback', async () => {
+    const sleep = vi.fn().mockResolvedValue(undefined);
+    const rl: TestResult = { kind: 'rate_limited', retryAfterSec: 0, source: 'monitor' };
+    const { fetcher } = makeFetcherWithTest({
+      test: { 1: [rl, rl, rl, rl] },
+      get: { 1: [ok(detail('down'))] },
+    });
+    const out = await evaluateMonitor(
+      1,
+      { fetcher, sleep },
+      { strictFlapping: true, unknownRetryDelayMs: 0 },
+    );
+    expect(out.outcome).toEqual({ kind: 'unhealthy', reason: 'down' });
+    expect(out.detail).toMatch(/^\(fallback\)/);
+  });
+
+  it('400 unsupported → fallback, warning logged, cached GET up → healthy', async () => {
+    const { fetcher } = makeFetcherWithTest({
+      test: { 1: [{ kind: 'unsupported', message: "monitor type 'tcp' is not yet supported" }] },
+      get: { 1: [ok(detail('up'))] },
+    });
+    const out = await evaluateMonitor(
+      1,
+      { fetcher, sleep: vi.fn() },
+      { strictFlapping: true, unknownRetryDelayMs: 0 },
+    );
+    expect(out.outcome.kind).toBe('healthy');
+    expect(out.detail).toMatch(/^\(fallback\)/);
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('falling back to cached state'));
+  });
+
+  it('500 → retry once at 2s, then fallback to cached GET', async () => {
+    const sleep = vi.fn().mockResolvedValue(undefined);
+    const { fetcher } = makeFetcherWithTest({
+      test: {
+        1: [
+          { kind: 'http_error', status: 500, body: '{"error":"server error"}' },
+          { kind: 'http_error', status: 500, body: '{"error":"server error"}' },
+        ],
+      },
+      get: { 1: [ok(detail('up'))] },
+    });
+    const out = await evaluateMonitor(
+      1,
+      { fetcher, sleep },
+      { strictFlapping: true, unknownRetryDelayMs: 0 },
+    );
+    expect(out.outcome.kind).toBe('healthy');
+    expect(out.detail).toMatch(/^\(fallback\)/);
+    expect(sleep).toHaveBeenCalledWith(2000);
+    expect(sleep).toHaveBeenCalledTimes(1);
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('5xx after retry'));
+  });
+
+  it('401 from /test → auth_error outcome, no GET fallback', async () => {
+    const { fetcher, getCalls } = makeFetcherWithTest({
+      test: { 1: [{ kind: 'http_error', status: 401, body: '{"error":"unauthorized"}' }] },
+      get: {},
+    });
+    const out = await evaluateMonitor(
+      1,
+      { fetcher, sleep: vi.fn() },
+      { strictFlapping: true, unknownRetryDelayMs: 0 },
+    );
+    expect(out.outcome).toEqual({ kind: 'unhealthy', reason: 'auth_error' });
+    expect(getCalls).toEqual([]);
+    expect(out.detail).toContain('401');
+  });
+
+  it('404 from /test → auth_error outcome, no GET fallback', async () => {
+    const { fetcher, getCalls } = makeFetcherWithTest({
+      test: { 1: [{ kind: 'http_error', status: 404, body: '{"error":"not found"}' }] },
+      get: {},
+    });
+    const out = await evaluateMonitor(
+      1,
+      { fetcher, sleep: vi.fn() },
+      { strictFlapping: true, unknownRetryDelayMs: 0 },
+    );
+    expect(out.outcome).toEqual({ kind: 'unhealthy', reason: 'auth_error' });
+    expect(getCalls).toEqual([]);
+  });
+
+  it('transport_error from /test → fallback to cached GET (backwards-compat)', async () => {
+    const { fetcher, getCalls } = makeFetcherWithTest({
+      test: { 1: [{ kind: 'transport_error', message: 'ECONNREFUSED' }] },
+      get: { 1: [ok(detail('up'))] },
+    });
+    const out = await evaluateMonitor(
+      1,
+      { fetcher, sleep: vi.fn() },
+      { strictFlapping: true, unknownRetryDelayMs: 0 },
+    );
+    expect(out.outcome.kind).toBe('healthy');
+    expect(getCalls).toEqual([1]);
+    expect(out.detail).toMatch(/^\(fallback\)/);
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('transport error'));
+  });
+
+  it('protocol_error from /test → fallback to cached GET', async () => {
+    const { fetcher, getCalls } = makeFetcherWithTest({
+      test: { 1: [{ kind: 'protocol_error', message: 'unexpected state: paused' }] },
+      get: { 1: [ok(detail('up'))] },
+    });
+    const out = await evaluateMonitor(
+      1,
+      { fetcher, sleep: vi.fn() },
+      { strictFlapping: true, unknownRetryDelayMs: 0 },
+    );
+    expect(out.outcome.kind).toBe('healthy');
+    expect(getCalls).toEqual([1]);
+    expect(out.detail).toMatch(/^\(fallback\)/);
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('protocol error'));
+  });
+});
+
+// ─── run() ───────────────────────────────────────────────────────────────────
+
 describe('run (multi-monitor fan-out)', () => {
   const apiKey = 'umk_test_abcdef0123456789';
   let originalEnv: NodeJS.ProcessEnv;
@@ -202,6 +483,7 @@ describe('run (multi-monitor fan-out)', () => {
     setOutput = vi.spyOn(core, 'setOutput').mockImplementation(() => undefined);
     vi.spyOn(core, 'info').mockImplementation(() => undefined);
     vi.spyOn(core, 'error').mockImplementation(() => undefined);
+    vi.spyOn(core, 'warning').mockImplementation(() => undefined);
     vi.spyOn(core, 'setSecret').mockImplementation(() => undefined);
   });
 
@@ -322,5 +604,57 @@ describe('run (multi-monitor fan-out)', () => {
     for (const call of setFailed.mock.calls) {
       expect(String(call[0])).not.toContain(apiKey);
     }
+  });
+
+  it('401 from /test for all monitors → exit code 2 (auth/config error)', async () => {
+    process.env['INPUT_MONITOR-IDS'] = '1';
+    process.env['INPUT_UNKNOWN-RETRY-DELAY-SECONDS'] = '0';
+    const { fetcher } = makeFetcherWithTest({
+      test: { 1: [{ kind: 'http_error', status: 401, body: '{"error":"unauthorized"}' }] },
+      get: {},
+    });
+    await run({ fetcher, sleep: vi.fn() });
+    expect(process.exitCode).toBe(2);
+    expect(setFailed).toHaveBeenCalled();
+  });
+
+  it('kill-switch short-circuits loop: exit 4, all monitors in outputs, only first tested', async () => {
+    process.env['INPUT_MONITOR-IDS'] = '1,2';
+    process.env['INPUT_UNKNOWN-RETRY-DELAY-SECONDS'] = '0';
+    const { fetcher, testCalls } = makeFetcherWithTest({
+      test: {
+        1: [{ kind: 'kill_switch', retryAfterSec: 60 }],
+        2: [],
+      },
+      get: {},
+    });
+    await run({ fetcher, sleep: vi.fn() });
+    expect(process.exitCode).toBe(EXIT_KILL_SWITCH);
+    expect(setFailed).toHaveBeenCalledWith(expect.stringContaining('kill switch'));
+    expect(setFailed).toHaveBeenCalledWith(expect.stringContaining('60'));
+    expect(testCalls).toEqual([1]); // monitor 2 never reached
+    expect(setOutput).toHaveBeenCalledWith('unhealthy-count', '2'); // both synthetic
+    expect(setOutput).toHaveBeenCalledWith('unhealthy-ids', '1,2');
+  });
+
+  it('all monitors down via /test → correct down-ids and unhealthy-ids outputs', async () => {
+    process.env['INPUT_MONITOR-IDS'] = '10,20';
+    process.env['INPUT_UNKNOWN-RETRY-DELAY-SECONDS'] = '0';
+    const { fetcher } = makeFetcherWithTest({
+      test: {
+        10: [
+          { kind: 'ok', probe: { state: 'down', region: null, statusCode: null, errorText: null } },
+        ],
+        20: [
+          { kind: 'ok', probe: { state: 'down', region: null, statusCode: null, errorText: null } },
+        ],
+      },
+      get: {},
+    });
+    await run({ fetcher, sleep: vi.fn() });
+    expect(setOutput).toHaveBeenCalledWith('unhealthy-count', '2');
+    expect(setOutput).toHaveBeenCalledWith('unhealthy-ids', '10,20');
+    expect(setOutput).toHaveBeenCalledWith('down-ids', '10,20');
+    expect(setFailed).toHaveBeenCalled();
   });
 });

@@ -95,4 +95,20 @@ describe('writeStepSummary', () => {
     expect(content).toContain('xxxx');
     expect(content).not.toContain('x'.repeat(200));
   });
+
+  it('(fallback) prefix in detail is rendered verbatim (HTML-escaped along with rest of cell)', async () => {
+    await writeStepSummary([
+      {
+        id: 42,
+        observedStatus: 'up',
+        outcome: { kind: 'healthy', reason: 'up' },
+        lastCheckAt: null,
+        region: null,
+        detail: '(fallback) EU-W · HTTP 200',
+      },
+    ]);
+    const content = await fs.readFile(summaryFile, 'utf8');
+    expect(content).toContain('(fallback) EU-W');
+    expect(content).toContain('HTTP 200');
+  });
 });

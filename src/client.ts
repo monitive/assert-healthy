@@ -6,6 +6,7 @@ export const API_BASE_URL = 'https://api.uptimemonitoring.com';
 export const USER_AGENT = 'uptimemonitoring-assert-healthy';
 
 const KNOWN_STATUSES: readonly string[] = ['up', 'down', 'unknown', 'flapping'];
+const TEST_STATUSES: readonly string[] = ['up', 'down'];
 
 export interface MonitorDetail {
   monitor: { id: number; url?: string; type?: string };
@@ -30,8 +31,25 @@ export type FetchResult =
   | { kind: 'transport_error'; message: string }
   | { kind: 'protocol_error'; message: string };
 
+export interface TestProbe {
+  state: 'up' | 'down';
+  region: string | null;
+  statusCode: number | null;
+  errorText: string | null;
+}
+
+export type TestResult =
+  | { kind: 'ok'; probe: TestProbe }
+  | { kind: 'rate_limited'; retryAfterSec: number | null; source: 'monitor' | 'domain' | 'unknown' }
+  | { kind: 'kill_switch'; retryAfterSec: number | null }
+  | { kind: 'unsupported'; message: string }
+  | { kind: 'http_error'; status: number; body: string }
+  | { kind: 'transport_error'; message: string }
+  | { kind: 'protocol_error'; message: string };
+
 export interface Fetcher {
   getMonitor(monitorId: number): Promise<FetchResult>;
+  testMonitor(monitorId: number): Promise<TestResult>;
 }
 
 export interface FetcherOptions {
@@ -85,6 +103,44 @@ function validateMonitorDetail(
   return { kind: 'ok', detail: parsed as MonitorDetail };
 }
 
+// Only accept 'up' | 'down' from /test; anything else is a protocol error so
+// decide() can never return 'retry' on the fresh-probe path.
+function validateTestProbe(
+  parsed: unknown,
+): { kind: 'ok'; probe: TestProbe } | { kind: 'protocol_error'; message: string } {
+  if (!parsed || typeof parsed !== 'object') {
+    return { kind: 'protocol_error', message: 'test response body is not a JSON object' };
+  }
+  const obj = parsed as Record<string, unknown>;
+  if (typeof obj.state !== 'string') {
+    return { kind: 'protocol_error', message: 'test response missing state field' };
+  }
+  if (!TEST_STATUSES.includes(obj.state)) {
+    return { kind: 'protocol_error', message: `unexpected state from /test: ${obj.state}` };
+  }
+  const region = typeof obj.region === 'string' ? obj.region : null;
+  const statusCode = typeof obj.status_code === 'number' ? obj.status_code : null;
+  const errorText = typeof obj.error === 'string' ? obj.error : null;
+  return {
+    kind: 'ok',
+    probe: { state: obj.state as 'up' | 'down', region, statusCode, errorText },
+  };
+}
+
+function parseRetryAfterHeader(
+  value: string | string[] | undefined,
+  nowMs = Date.now(),
+): number | null {
+  const str = typeof value === 'string' ? value : value?.[0];
+  if (str === undefined) return null;
+  const n = parseInt(str, 10);
+  if (!isNaN(n) && n > 0) return n;
+  // RFC 7231: Retry-After may also be an HTTP-date string.
+  const ts = Date.parse(str);
+  if (!isNaN(ts)) return Math.max(0, Math.ceil((ts - nowMs) / 1000));
+  return null;
+}
+
 export function createFetcher(opts: FetcherOptions): Fetcher {
   const baseUrl = (opts.baseUrl ?? API_BASE_URL).replace(/\/+$/, '');
   const auth = new BearerCredentialHandler(opts.apiKey);
@@ -95,6 +151,14 @@ export function createFetcher(opts: FetcherOptions): Fetcher {
   // strip the bearer token and produce a misleading 401. We surface the
   // redirect status as an http_error instead.
   const client = new HttpClient(USER_AGENT, [auth], { allowRedirects: false });
+  // Use a separate client for /test with an explicit socket timeout; the
+  // default 3-minute timeout inherited from @actions/http-client is too loose
+  // for a single probe that takes ~4s upstream, and we don't want to tighten
+  // the GET path that the cached fallback relies on.
+  const testClient = new HttpClient(USER_AGENT, [auth], {
+    allowRedirects: false,
+    socketTimeout: 15000,
+  });
 
   async function fetchOnce(url: string): Promise<FetchResult> {
     let response: HttpClientResponse;
@@ -149,6 +213,77 @@ export function createFetcher(opts: FetcherOptions): Fetcher {
         return first;
       }
       return second;
+    },
+
+    async testMonitor(monitorId: number): Promise<TestResult> {
+      const url = `${baseUrl}/api/v1/monitors/${monitorId}/test`;
+      let response: HttpClientResponse;
+      try {
+        response = await testClient.post(url, '', {
+          accept: 'application/json',
+          'user-agent': USER_AGENT,
+        });
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        return { kind: 'transport_error', message };
+      }
+
+      const status = response.message.statusCode ?? 0;
+      let body: string;
+      try {
+        body = await response.readBody();
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        return { kind: 'transport_error', message: `body read failed: ${message}` };
+      }
+
+      if (status >= 200 && status < 300) {
+        try {
+          const parsed = JSON.parse(body) as unknown;
+          const validation = validateTestProbe(parsed);
+          if (validation.kind === 'protocol_error') return validation;
+          return { kind: 'ok', probe: validation.probe };
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          return { kind: 'protocol_error', message: `invalid JSON: ${message}` };
+        }
+      }
+
+      if (status === 429) {
+        const retryAfterSec = parseRetryAfterHeader(response.message.headers['retry-after']);
+        let source: 'monitor' | 'domain' | 'unknown' = 'unknown';
+        if (body.includes('too many tests')) source = 'monitor';
+        else if (body.includes('domain rate limit')) source = 'domain';
+        return { kind: 'rate_limited', retryAfterSec, source };
+      }
+
+      // kill_switch_active is a deliberate operator pause; a "real" upstream 503
+      // with no marker rides the generic http_error path and falls back to cached.
+      if (status === 503 && body.includes('kill_switch_active')) {
+        let retryAfterSec = parseRetryAfterHeader(response.message.headers['retry-after']);
+        if (retryAfterSec === null) {
+          try {
+            const parsed = JSON.parse(body) as Record<string, unknown>;
+            const bodyVal = parsed['retry_after'];
+            if (typeof bodyVal === 'number' && bodyVal > 0) retryAfterSec = bodyVal;
+          } catch {
+            /* body may not be JSON */
+          }
+        }
+        return { kind: 'kill_switch', retryAfterSec };
+      }
+
+      if (status === 400) {
+        // "not yet supported" = non-HTTP monitor type; fall through to cached GET.
+        // Any other 400 is a real client/API contract error — fail fatally rather
+        // than silently masking it behind the cached-state fallback.
+        if (body.includes('not yet supported')) {
+          return { kind: 'unsupported', message: body };
+        }
+        return { kind: 'http_error', status, body };
+      }
+
+      return { kind: 'http_error', status, body };
     },
   };
 }
