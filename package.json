@@ -23,7 +23,7 @@
   },
   "dependencies": {
     "@actions/core": "1.11.1",
-    "@actions/http-client": "2.2.3"
+    "@actions/http-client": "4.0.1"
   },
   "devDependencies": {
     "@types/node": "20.17.10",
